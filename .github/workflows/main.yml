@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   rdp-session:
-    # registre o runner com: ./config.cmd --labels rtx5080,32gb
+    # Registre o runner com: .\config.cmd --url <URL> --token <TOKEN> --labels rtx5080,32gb
     runs-on: [self-hosted, windows, x64, rtx5080]
     timeout-minutes: 360
 
@@ -23,31 +23,44 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $gpu = (Get-CimInstance Win32_VideoController | Select-Object -First 1).Name
-          $cpu = (Get-CimInstance Win32_Processor).NumberOfLogicalProcessors
-          $ram = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB)
+          $gpus = Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name
+          $cpu  = (Get-CimInstance Win32_Processor).NumberOfLogicalProcessors
+          $ram  = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB)
           $disk = [math]::Round((Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'").FreeSpace / 1GB)
-          Write-Host "GPU: $gpu | Cores: $cpu | RAM: ${ram}GB | Livre em C: ${disk}GB"
-          if ($gpu -notmatch '5080') { Write-Warning "GPU não é 5080 (encontrado: $gpu)" }
+
+          $gpus | ForEach-Object { Write-Host "GPU: $_" }
+          Write-Host "Cores: $cpu | RAM: ${ram}GB | Livre em C: ${disk}GB"
+
+          if (-not ($gpus -match '5080')) { Write-Warning "Nenhuma RTX 5080 detectada nesta máquina." }
+          if ($cpu -lt 8)                  { Write-Warning "Menos de 8 threads lógicas ($cpu)." }
+          if ($ram -lt 30)                 { Write-Warning "RAM abaixo de 32GB (${ram}GB)." }
+          if ($disk -lt 50)                { Write-Warning "Pouco espaço livre em C: (${disk}GB)." }
 
       - name: Configure Core RDP Settings
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          Write-Host ">>> Configurando RDP..."
+
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
                            -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                            -Name "UserAuthentication" -Value 0 -Force
+
           Remove-NetFirewallRule -DisplayName "RDP-Pop" -ErrorAction SilentlyContinue
           New-NetFirewallRule -DisplayName "RDP-Pop" -Direction Inbound -Action Allow `
             -Protocol TCP -LocalPort 3389 -Profile Any
+
           Set-Service -Name TermService -StartupType Automatic
           Restart-Service -Name TermService -Force
+          Write-Host ">>> RDP ligado."
 
       - name: Create RDP User with Secure Password
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          Write-Host ">>> Criando usuário RDP..."
+
           $charSet = @{
               Upper   = [char[]](65..90)
               Lower   = [char[]](97..122)
@@ -61,18 +74,20 @@ jobs:
           $raw += $charSet.Special | Get-Random -Count 4
           $password = -join ($raw | Sort-Object { Get-Random })
 
-          $userName = "RDP"
+          $userName   = "RDP"
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
           if (-not (Get-LocalUser -Name $userName -ErrorAction SilentlyContinue)) {
               New-LocalUser -Name $userName -Password $securePass `
                 -AccountNeverExpires -PasswordNeverExpires -Description "RDP temporário"
           } else {
               Set-LocalUser -Name $userName -Password $securePass -PasswordNeverExpires $true
           }
-          Add-LocalGroupMember -Group "Administrators" -Member $userName -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators"       -Member $userName -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member $userName -ErrorAction SilentlyContinue
 
           Add-Content -Path $env:GITHUB_ENV -Value "RDP_PASS=$password" -Encoding utf8
+          Write-Host ">>> Usuário criado."
 
       - name: Establish Tailscale Connection
         shell: pwsh
@@ -80,26 +95,35 @@ jobs:
           TS_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
           $ErrorActionPreference = 'Stop'
+          Write-Host ">>> Conectando ao Tailscale..."
+
           $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
-          if (-not (Test-Path $tsExe)) { throw "Tailscale não instalado nesta máquina." }
+          if (-not (Test-Path $tsExe)) {
+              throw "Tailscale não encontrado em $tsExe. Instale antes de registrar o runner."
+          }
 
           & $tsExe up --authkey=$env:TS_KEY --hostname="rtx5080-$env:GITHUB_RUN_ID" --accept-dns=false
 
-          $tsIP = $null; $retries = 0
+          $tsIP = $null
+          $retries = 0
           while (-not $tsIP -and $retries -lt 20) {
               $tsIP = & $tsExe ip -4
               if (-not $tsIP) { Start-Sleep -Seconds 5 }
               $retries++
           }
           if (-not $tsIP) { throw "IP do Tailscale não atribuído." }
+
           Add-Content -Path $env:GITHUB_ENV -Value "TAILSCALE_IP=$tsIP" -Encoding utf8
+          Write-Host ">>> IP Tailscale: $tsIP"
 
       - name: Final Status
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          $h = [math]::Min([int]"${{ inputs.horas }}", 6)
+
           $summary = @"
-          ## Sessão RDP aberta — 6h
+          ## Sessão RDP aberta — ${h}h
 
           | Campo | Valor |
           |---|---|
@@ -112,15 +136,48 @@ jobs:
 
           Hardware: RTX 5080 / 8 cores / 32 GB / 228 GB
           "@
+
           Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $summary -Encoding utf8
+          Write-Host $summary
 
       - name: Keep Alive
         shell: pwsh
         run: |
           $h = [math]::Min([int]"${{ inputs.horas }}", 6)
           $deadline = (Get-Date).AddHours($h).AddMinutes(-9)
+          Write-Host ">>> Mantendo sessão viva por $h h."
           while ((Get-Date) -lt $deadline) {
               Start-Sleep -Seconds 60
               Write-Host ">>> Ativo. Restam $([int](($deadline - (Get-Date)).TotalMinutes)) min."
           }
           Write-Host ">>> Encerrando graciosamente."
+
+      - name: Cleanup
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host ">>> Limpando sessão..."
+
+          try {
+              $lines = (quser 2>$null) | Select-Object -Skip 1
+              foreach ($line in $lines) {
+                  if ($line -match '^\s*>?\s*RDP\s+.*?(\d+)\s') {
+                      $id = $matches[1]
+                      logoff $id 2>$null
+                      Write-Host ">>> Sessão $id encerrada."
+                  }
+              }
+          } catch { Write-Warning "Falha ao encerrar sessões: $_" }
+
+          try {
+              & "$env:ProgramFiles\Tailscale\tailscale.exe" down 2>$null
+              Write-Host ">>> Tailscale desconectado."
+          } catch { Write-Warning "Falha ao desconectar Tailscale: $_" }
+
+          try {
+              Remove-LocalUser -Name "RDP" -ErrorAction Stop
+              Write-Host ">>> Usuário RDP removido."
+          } catch { Write-Warning "Usuário RDP não removido: $_" }
+
+          Remove-NetFirewallRule -DisplayName "RDP-Pop" -ErrorAction SilentlyContinue
+          Write-Host ">>> Limpeza concluída."
